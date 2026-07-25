@@ -278,6 +278,85 @@ func TestTransfer_ConcurrentCannotOverdraw(t *testing.T) {
 	}
 }
 
+// TestTransfer_ConcurrentMultiAccountCannotOverdraw is the escalated version
+// of the single-account race test: 500 goroutines hammer 4 distinct funded
+// accounts concurrently (spreading contention instead of concentrating it
+// on one document), each racing to overdraw its own account. Every account
+// is funded for exactly 63 successful transfers out of 125 attempts, so
+// the outcome is fully deterministic regardless of goroutine interleaving.
+func TestTransfer_ConcurrentMultiAccountCannotOverdraw(t *testing.T) {
+	l := newTestLedger(t)
+	ctx := context.Background()
+
+	const numAccounts = 4
+	const goroutinesPerAccount = 125
+	const perTransfer = 100
+	const fundedBalance = 6_300                                             // = 63 * perTransfer
+	const wantSuccessPerAccount = fundedBalance / perTransfer               // 63
+	const wantFailPerAccount = goroutinesPerAccount - wantSuccessPerAccount // 62
+
+	users := make([]string, numAccounts)
+	for a := 0; a < numAccounts; a++ {
+		users[a] = fmt.Sprintf("racer-%d", a)
+		mustGrant(t, l, users[a], fundedBalance)
+	}
+
+	var wg sync.WaitGroup
+	succeeded := make([]int64, numAccounts)
+	failed := make([]int64, numAccounts)
+
+	for a := 0; a < numAccounts; a++ {
+		from := Party{OwnerType: OwnerUser, OwnerID: users[a]}
+		for g := 0; g < goroutinesPerAccount; g++ {
+			wg.Add(1)
+			go func(acctIdx, g int) {
+				defer wg.Done()
+				to := Party{OwnerType: OwnerMarketEscrow, OwnerID: fmt.Sprintf("market-race-%d-%d", acctIdx, g)}
+				txnID := fmt.Sprintf("stake:multirace:%d:%d", acctIdx, g)
+				err := l.Transfer(ctx, txnID, from, to, Amount{Amount: perTransfer, Currency: "NGN_PLAY"}, EntryStake, TransferRef{})
+				switch {
+				case err == nil:
+					atomic.AddInt64(&succeeded[acctIdx], 1)
+				case errors.Is(err, ErrInsufficientFunds):
+					atomic.AddInt64(&failed[acctIdx], 1)
+				default:
+					t.Errorf("account %d goroutine %d: unexpected error: %v", acctIdx, g, err)
+				}
+			}(a, g)
+		}
+	}
+	wg.Wait()
+
+	for a := 0; a < numAccounts; a++ {
+		if succeeded[a] != wantSuccessPerAccount {
+			t.Errorf("account %d: succeeded = %d, want %d", a, succeeded[a], wantSuccessPerAccount)
+		}
+		if failed[a] != wantFailPerAccount {
+			t.Errorf("account %d: failed = %d, want %d", a, failed[a], wantFailPerAccount)
+		}
+
+		from := Party{OwnerType: OwnerUser, OwnerID: users[a]}
+		acct, err := l.Account(ctx, from, "NGN_PLAY")
+		if err != nil {
+			t.Fatalf("account %d: %v", a, err)
+		}
+		if acct.Balance != 0 {
+			t.Errorf("account %d: balance = %d, want exactly 0 (no overdraw, no leftover)", a, acct.Balance)
+		}
+		if acct.Balance < 0 {
+			t.Errorf("account %d: balance went negative: %d", a, acct.Balance)
+		}
+
+		sum, err := l.SumEntriesForAccount(ctx, acct.ID)
+		if err != nil {
+			t.Fatalf("account %d sum entries: %v", a, err)
+		}
+		if sum != acct.Balance {
+			t.Errorf("account %d: balance cache invariant violated: cached %d != sum of entries %d", a, acct.Balance, sum)
+		}
+	}
+}
+
 // TestBalanceCache_AlwaysEqualsSumOfEntries is a property check run after a
 // mixed sequence of grants, transfers, and rejected overdrafts: every
 // touched account's cached balance must equal the signed sum of its
