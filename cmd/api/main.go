@@ -1,6 +1,6 @@
-// Command api is the Stubborn.fun HTTP entrypoint. Phase 1 wires up just
-// enough to prove the Mongo replica set / ledger indexes / HTTP server
-// boot correctly end to end; routes land in later phases.
+// Command api is the Stubborn.fun HTTP entrypoint. It currently boots the
+// datastore, ensures indexes, and runs the market auto-close scheduler;
+// route handlers land in Phase 5.
 package main
 
 import (
@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/ofuzorchukwuemeke/stubborn.fun/internal/ledger"
+	"github.com/ofuzorchukwuemeke/stubborn.fun/internal/market"
 	"github.com/ofuzorchukwuemeke/stubborn.fun/internal/platform"
 )
 
@@ -34,11 +35,25 @@ func main() {
 		_ = client.Disconnect(shutdownCtx)
 	}()
 
+	// Indexes are a correctness dependency, not just a performance one:
+	// the ledger's idempotency rests on a unique index, and the
+	// scheduler's poll would otherwise be a collection scan.
 	if err := ledger.EnsureIndexes(ctx, db); err != nil {
 		log.Fatalf("ledger indexes: %v", err)
 	}
+	if err := market.EnsureIndexes(ctx, db); err != nil {
+		log.Fatalf("market indexes: %v", err)
+	}
 
 	_ = ledger.New(client, db)
+
+	clock := platform.SystemClock{}
+	markets := market.NewStore(db, clock)
+
+	// In-process auto-close scheduler. Safe to run on several instances:
+	// each transition is a compare-and-swap, so only one closer wins.
+	scheduler := market.NewScheduler(markets, clock, market.DefaultTickInterval, nil)
+	go scheduler.Run(ctx)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
