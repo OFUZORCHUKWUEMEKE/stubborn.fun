@@ -17,6 +17,7 @@ import (
 	"github.com/ofuzorchukwuemeke/stubborn.fun/internal/ledger"
 	"github.com/ofuzorchukwuemeke/stubborn.fun/internal/market"
 	"github.com/ofuzorchukwuemeke/stubborn.fun/internal/platform"
+	"github.com/ofuzorchukwuemeke/stubborn.fun/internal/stake"
 )
 
 func main() {
@@ -44,11 +45,18 @@ func main() {
 	if err := market.EnsureIndexes(ctx, db); err != nil {
 		log.Fatalf("market indexes: %v", err)
 	}
-
-	_ = ledger.New(client, db)
+	if err := stake.EnsureIndexes(ctx, db); err != nil {
+		log.Fatalf("stake indexes: %v", err)
+	}
 
 	clock := platform.SystemClock{}
+	led := ledger.New(client, db)
 	markets := market.NewStore(db, clock)
+
+	// Circle membership arrives in Phase 6. Until then this denies every
+	// circle-market stake: an unimplemented visibility check must fail
+	// closed rather than admit everyone.
+	_ = stake.NewService(client, db, led, markets, stake.DenyAllMembership{}, clock, stake.DefaultConfig())
 
 	// In-process auto-close scheduler. Safe to run on several instances:
 	// each transition is a compare-and-swap, so only one closer wins.

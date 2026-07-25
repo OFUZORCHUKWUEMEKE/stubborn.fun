@@ -61,18 +61,9 @@ func (l *Ledger) getOrCreateAccount(ctx context.Context, p Party, currency strin
 	return acct, nil
 }
 
-// Transfer moves Amount from one account to another as a single atomic,
-// idempotent posting. It:
-//   - rejects non-positive amounts and empty currency (ErrInvalidAmount)
-//   - rejects from == to (ErrSameAccount)
-//   - rejects overdrawing a non-Unlimited account (ErrInsufficientFunds)
-//   - is a no-op (nil error, no new entries) if txnID was already applied
-//
-// Both legs of the posting share txnID; the unique (txn_id, account_id)
-// index on entries is what makes replay detection safe under concurrent
-// retries of the same logical operation (e.g. an HTTP client retrying
-// after a timeout).
-func (l *Ledger) Transfer(ctx context.Context, txnID string, from, to Party, amount Amount, entryType EntryType, ref TransferRef) error {
+// validateTransfer applies the input checks shared by Transfer and
+// TransferTx, before any Mongo work happens.
+func validateTransfer(txnID string, from, to Party, amount Amount) error {
 	if txnID == "" {
 		return fmt.Errorf("ledger: txnID must not be empty")
 	}
@@ -82,6 +73,99 @@ func (l *Ledger) Transfer(ctx context.Context, txnID string, from, to Party, amo
 	if from == to {
 		return ErrSameAccount
 	}
+	return nil
+}
+
+// transferInTx is the actual posting, performed with whatever session the
+// supplied context carries. It never manages sessions itself, so it can be
+// used both as its own transaction (Transfer) and as one step of a larger
+// one (TransferTx).
+//
+// On a txnID replay it returns ErrDuplicateTxn rather than swallowing it:
+// once a write inside a Mongo transaction fails, that transaction cannot
+// continue, so the decision to treat a replay as benign has to be made by
+// whoever owns the transaction.
+func (l *Ledger) transferInTx(ctx context.Context, txnID string, from, to Party, amount Amount, entryType EntryType, ref TransferRef) error {
+	fromAcct, err := l.getOrCreateAccount(ctx, from, amount.Currency)
+	if err != nil {
+		return err
+	}
+	toAcct, err := l.getOrCreateAccount(ctx, to, amount.Currency)
+	if err != nil {
+		return err
+	}
+
+	if !fromAcct.Unlimited && fromAcct.Balance < amount.Amount {
+		return ErrInsufficientFunds
+	}
+
+	now := time.Now().UTC()
+	debit := Entry{
+		ID:        bson.NewObjectID(),
+		TxnID:     txnID,
+		AccountID: fromAcct.ID,
+		Amount:    amount.Amount,
+		Currency:  amount.Currency,
+		Direction: Debit,
+		Type:      entryType,
+		MarketID:  ref.MarketID,
+		Ref:       ref.Note,
+		CreatedAt: now,
+	}
+	credit := Entry{
+		ID:        bson.NewObjectID(),
+		TxnID:     txnID,
+		AccountID: toAcct.ID,
+		Amount:    amount.Amount,
+		Currency:  amount.Currency,
+		Direction: Credit,
+		Type:      entryType,
+		MarketID:  ref.MarketID,
+		Ref:       ref.Note,
+		CreatedAt: now,
+	}
+
+	if _, err := l.entries.InsertMany(ctx, []any{debit, credit}); err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			return ErrDuplicateTxn
+		}
+		return err
+	}
+
+	if _, err := l.accounts.UpdateByID(ctx, fromAcct.ID, bson.M{
+		"$inc": bson.M{"balance": -amount.Amount},
+		"$set": bson.M{"updated_at": now},
+	}); err != nil {
+		return err
+	}
+	if _, err := l.accounts.UpdateByID(ctx, toAcct.ID, bson.M{
+		"$inc": bson.M{"balance": amount.Amount},
+		"$set": bson.M{"updated_at": now},
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Transfer moves Amount from one account to another as a single atomic,
+// idempotent posting, in a transaction of its own. It:
+//   - rejects non-positive amounts and empty currency (ErrInvalidAmount)
+//   - rejects from == to (ErrSameAccount)
+//   - rejects overdrawing a non-Unlimited account (ErrInsufficientFunds)
+//   - is a no-op (nil error, no new entries) if txnID was already applied
+//
+// Both legs of the posting share txnID; the unique (txn_id, account_id)
+// index on entries is what makes replay detection safe under concurrent
+// retries of the same logical operation (e.g. an HTTP client retrying
+// after a timeout).
+//
+// Callers that must move money atomically with other writes (stake,
+// settle) use TransferTx inside their own transaction instead.
+func (l *Ledger) Transfer(ctx context.Context, txnID string, from, to Party, amount Amount, entryType EntryType, ref TransferRef) error {
+	if err := validateTransfer(txnID, from, to, amount); err != nil {
+		return err
+	}
 
 	session, err := l.client.StartSession()
 	if err != nil {
@@ -90,72 +174,31 @@ func (l *Ledger) Transfer(ctx context.Context, txnID string, from, to Party, amo
 	defer session.EndSession(ctx)
 
 	_, err = session.WithTransaction(ctx, func(txCtx context.Context) (any, error) {
-		fromAcct, err := l.getOrCreateAccount(txCtx, from, amount.Currency)
-		if err != nil {
-			return nil, err
-		}
-		toAcct, err := l.getOrCreateAccount(txCtx, to, amount.Currency)
-		if err != nil {
-			return nil, err
-		}
-
-		if !fromAcct.Unlimited && fromAcct.Balance < amount.Amount {
-			return nil, ErrInsufficientFunds
-		}
-
-		now := time.Now().UTC()
-		debit := Entry{
-			ID:        bson.NewObjectID(),
-			TxnID:     txnID,
-			AccountID: fromAcct.ID,
-			Amount:    amount.Amount,
-			Currency:  amount.Currency,
-			Direction: Debit,
-			Type:      entryType,
-			MarketID:  ref.MarketID,
-			Ref:       ref.Note,
-			CreatedAt: now,
-		}
-		credit := Entry{
-			ID:        bson.NewObjectID(),
-			TxnID:     txnID,
-			AccountID: toAcct.ID,
-			Amount:    amount.Amount,
-			Currency:  amount.Currency,
-			Direction: Credit,
-			Type:      entryType,
-			MarketID:  ref.MarketID,
-			Ref:       ref.Note,
-			CreatedAt: now,
-		}
-
-		if _, err := l.entries.InsertMany(txCtx, []any{debit, credit}); err != nil {
-			if mongo.IsDuplicateKeyError(err) {
-				return nil, errIdempotentReplay
-			}
-			return nil, err
-		}
-
-		if _, err := l.accounts.UpdateByID(txCtx, fromAcct.ID, bson.M{
-			"$inc": bson.M{"balance": -amount.Amount},
-			"$set": bson.M{"updated_at": now},
-		}); err != nil {
-			return nil, err
-		}
-		if _, err := l.accounts.UpdateByID(txCtx, toAcct.ID, bson.M{
-			"$inc": bson.M{"balance": amount.Amount},
-			"$set": bson.M{"updated_at": now},
-		}); err != nil {
-			return nil, err
-		}
-
-		return nil, nil
+		return nil, l.transferInTx(txCtx, txnID, from, to, amount, entryType, ref)
 	})
 
-	if errors.Is(err, errIdempotentReplay) {
+	// A replay is reported to this caller as a successful no-op: the
+	// transaction that hit the duplicate aborted, so nothing was written
+	// twice.
+	if errors.Is(err, ErrDuplicateTxn) {
 		return nil
 	}
 	return err
+}
+
+// TransferTx performs the same posting as Transfer but inside a
+// transaction the caller already started — the context must carry that
+// session. Use it when money movement must commit atomically with other
+// documents, e.g. a stake's position insert and market pool increment.
+//
+// Unlike Transfer, a txnID replay surfaces as ErrDuplicateTxn: the
+// enclosing transaction is already doomed at that point and the caller
+// must abort it, then decide what a replay means for their operation.
+func (l *Ledger) TransferTx(ctx context.Context, txnID string, from, to Party, amount Amount, entryType EntryType, ref TransferRef) error {
+	if err := validateTransfer(txnID, from, to, amount); err != nil {
+		return err
+	}
+	return l.transferInTx(ctx, txnID, from, to, amount, entryType, ref)
 }
 
 // Grant credits a user's starter play-money balance from promo_pool. It is

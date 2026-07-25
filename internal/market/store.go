@@ -175,6 +175,74 @@ func (s *Store) FindOverdueOpen(ctx context.Context, now time.Time, limit int64)
 	return out, nil
 }
 
+// ApplyStake atomically adds amount to one outcome's pool and to
+// total_pool. It is the only sanctioned way to grow a market's pools, and
+// market is the only package that writes the markets collection.
+//
+// The filter carries every precondition that must hold at the instant of
+// the write, so none of them can be raced:
+//
+//   - the market exists,
+//   - it is still OPEN,
+//   - its close_at has not passed (state alone is insufficient: the
+//     scheduler polls on an interval, so there is a window where close_at
+//     has passed but the state is still OPEN),
+//   - the outcome exists.
+//
+// A caller running this inside its own transaction (stake.PlaceStake) gets
+// all-or-nothing behaviour against its other writes: if this returns an
+// error the caller aborts and the pools are never touched. Matching zero
+// documents is disambiguated into a typed error by re-reading.
+//
+// The amount is in the market's Currency minor units; callers must have
+// already moved the same amount into the market's escrow account.
+func (s *Store) ApplyStake(ctx context.Context, id bson.ObjectID, outcomeID string, amount int64) (Market, error) {
+	if amount <= 0 {
+		return Market{}, ErrInvalidStakeAmount
+	}
+
+	now := s.clock.Now()
+	filter := bson.M{
+		"_id":         id,
+		"state":       StateOpen,
+		"close_at":    bson.M{"$gt": now},
+		"outcomes.id": outcomeID,
+	}
+	update := bson.M{
+		"$inc": bson.M{"outcomes.$.pool": amount, "total_pool": amount},
+		"$set": bson.M{"updated_at": now},
+	}
+
+	opts := options.FindOneAndUpdate().SetReturnDocument(options.After)
+	var m Market
+	err := s.markets.FindOneAndUpdate(ctx, filter, update, opts).Decode(&m)
+	if err == nil {
+		return m, nil
+	}
+	if !errors.Is(err, mongo.ErrNoDocuments) {
+		return Market{}, fmt.Errorf("market: apply stake: %w", err)
+	}
+
+	// Nothing matched: report which precondition failed.
+	current, getErr := s.Get(ctx, id)
+	if getErr != nil {
+		return Market{}, getErr
+	}
+	if current.State != StateOpen {
+		return Market{}, fmt.Errorf("%w: %s is %s", ErrMarketClosed, id.Hex(), current.State)
+	}
+	if !current.CloseAt.After(now) {
+		return Market{}, fmt.Errorf("%w: %s closed at %s", ErrMarketClosed, id.Hex(), current.CloseAt)
+	}
+	if !current.HasOutcome(outcomeID) {
+		return Market{}, fmt.Errorf("%w: %q", ErrUnknownOutcome, outcomeID)
+	}
+	// All preconditions look satisfied on re-read, so the document moved
+	// between the update and the read. Report it as closed rather than
+	// guessing — the caller retries or surfaces it.
+	return Market{}, fmt.Errorf("%w: %s changed concurrently", ErrMarketClosed, id.Hex())
+}
+
 // transition performs a guarded state change as a single atomic
 // compare-and-swap: the `state: from` clause in the filter is the
 // precondition, so two concurrent callers attempting the same transition

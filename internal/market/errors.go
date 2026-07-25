@@ -17,6 +17,16 @@ var (
 	// ErrUnknownOutcome means the supplied outcome ID is not one of the
 	// market's outcomes.
 	ErrUnknownOutcome = errors.New("market: unknown outcome")
+
+	// ErrMarketClosed means the market is no longer accepting stakes:
+	// either its state has left OPEN or its close_at has passed. The two
+	// are distinct conditions — the scheduler polls on an interval, so a
+	// market can be past its deadline while still OPEN — but callers
+	// treat them identically, so they share one error.
+	ErrMarketClosed = errors.New("market: closed to stakes")
+
+	// ErrInvalidStakeAmount means a non-positive amount was applied.
+	ErrInvalidStakeAmount = errors.New("market: stake amount must be positive")
 )
 
 // Validation errors for Create.
