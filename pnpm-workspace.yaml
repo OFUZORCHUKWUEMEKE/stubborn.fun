@@ -1,0 +1,9 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# Only these packages may run install scripts: workerd (the Workers
+# runtime) and esbuild ship native binaries.
+onlyBuiltDependencies:
+  - esbuild
+  - workerd

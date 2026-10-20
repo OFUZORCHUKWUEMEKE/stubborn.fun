@@ -1,4 +1,8 @@
-/bin/
-*.test
-*.out
+node_modules/
+dist/
+.wrangler/
+.dev.vars
 .env
+*.log
+coverage/
+worker-configuration.d.ts
